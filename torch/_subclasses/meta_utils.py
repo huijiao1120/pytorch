@@ -269,6 +269,180 @@ class MetaConverter:
                 device="meta",
             )
 
+        # Creates a subclass instance with empty inner tensors according to the specified
+        # symbolic context.
+        def empty_create_subclass(
+            t,
+            outer_size,
+            outer_stride,
+            symbolic_context=symbolic_context,
+            callback=callback,
+            source=source,
+        ):
+            from torch._dynamo.source import AttrSource
+            from torch.fx.experimental.symbolic_shapes import SubclassSymbolicContext
+
+            assert symbolic_context is None or isinstance(
+                symbolic_context, SubclassSymbolicContext
+            )
+
+            # Note: transform_subclass will use __tensor_unflatten__ to generate
+            # a fresh subclass wrapper. We assume that if the inner tensors of
+            # the subclass are given symbolic sizes, their sizes will be used
+            # to construct the (symbolic) sizes of the wrapper tensor.
+            return transform_subclass(
+                t,
+                lambda attr, inner_t: callback(
+                    lambda: empty_create(
+                        inner_t,
+                        AttrSource(source, attr),
+                        symbolic_context=(
+                            None
+                            if symbolic_context is None
+                            else symbolic_context.inner_contexts[attr]
+                        ),
+                    )
+                ),
+                outer_size=outer_size,
+                outer_stride=outer_stride,
+            )
+
+        # Metafies the given tensor with fully dynamic dims and the given source.
+        def all_dynamic_meta_tensor(t, source, shape_env=shape_env, callback=callback):
+            from torch.fx.experimental.symbolic_shapes import (
+                DimDynamic,
+                SubclassSymbolicContext,
+                SymbolicContext,
+            )
+
+            t_symbolic_context: SymbolicContext
+            t_dynamic_sizes = [DimDynamic.DYNAMIC] * t.dim()
+            if is_traceable_wrapper_subclass(t):
+                inner_contexts = {}
+                attrs, _ = t.__tensor_flatten__()
+                for attr in attrs:
+                    assert isinstance(attr, str)
+                    inner = getattr(t, attr)
+                    inner_contexts[attr] = StatelessSymbolicContext(
+                        dynamic_sizes=[DimDynamic.DYNAMIC] * inner.dim(),
+                        constraint_sizes=[None] * inner.dim(),
+                    )
+                t_symbolic_context = SubclassSymbolicContext(
+                    dynamic_sizes=t_dynamic_sizes,
+                    constraint_sizes=[None] * t.dim(),
+                    inner_contexts=inner_contexts,
+                    tensor_source=source,
+                )
+            else:
+                t_symbolic_context = StatelessSymbolicContext(
+                    dynamic_sizes=t_dynamic_sizes,
+                    constraint_sizes=[None] * t.dim(),
+                )
+
+            return self.meta_tensor(
+                t,
+                shape_env,
+                callback,
+                source=source,
+                symbolic_context=t_symbolic_context,
+            )
+
+        # Returns a fake-ified version of an input view tensor t, given an already fake-ified
+        # base. At a high level, we want two things:
+        #   1. fake_t should have the same view relationship to the given fake base as the
+        #      input t has to its _base.
+        #   2. fake_t should have symbolic sizes / strides / storage offset according to the
+        #      appropriate symbolic context (i.e. from the automatic dynamic algorithm).
+        #
+        # We currently take different strategies across view types:
+        #   * For dense -> dense views, accomplish both (1) and (2) simultaneously via an
+        #     as_strided() call on the fake-ified base, passing symbolic metadata.
+        #   * For views involving subclasses, perform view replay using view funcs to
+        #     achieve (1). It's necessary for (2) to swap out any closed-over state in
+        #     the view funcs with symbolicized SymInts and fake-ified tensors. Doing this
+        #     avoids specialization (and thus over-eager simplification of symbols) that
+        #     could occur during view replay on the fake-ified base.
+        #
+        # Examples:
+        #   * t.unsqueeze(-1) with dense t is a dense -> dense view. It can be modeled
+        #     with an as_strided() call on the fake base passing symbolic metadata.
+        #   * sub.select(dim=0, index=3) is a subclass -> subclass view. The index arg
+        #     is made symbolic to avoid invalid specialization and view replay is then
+        #     done to reconstruct the view.
+        #   * _nested_from_jagged(values, offsets) is a dense -> subclass view
+        #     that returns a subclass instance from a dense values tensor. The offsets
+        #     tensor is closed over in the view func, as it can be considered view metadata.
+        #     First, the offsets tensor is fake-ified according to the inner symbolic
+        #     context and with the correct relationship to the outer size / stride metadata.
+        #     Then view replay is done, swapping in the fake offsets so the view replay output
+        #     is fully fake with no invalid specialization.
+        def view_from_base(base, t, source=source, shape_env=shape_env):
+            # fake-ify t's metadata according to the outer symbolic context
+            (sizes, strides, storage_offset) = sym_sizes_strides_storage_offset(
+                t, source
+            )
+            if not is_traceable_wrapper_subclass(
+                t
+            ) and not is_traceable_wrapper_subclass(base):
+                # Dense -> Dense view case uses as_strided() to construct view relationship.
+                # TODO: Change this logic to use view replay for consistency?
+                # It's likely there is no view func available.
+                return base.as_strided(sizes, strides, storage_offset)
+
+            from torch._dynamo.source import EphemeralSource
+
+            def symint_visitor_fn(s):
+                if shape_env is None:
+                    return s
+
+                # NB: The symbol here is expected to be simplified out.
+                sym_source = EphemeralSource("symint_visitor_fn")
+                symbol = shape_env.create_symbol(s, sym_source)
+                return shape_env.create_symintnode(symbol, hint=s, source=sym_source)
+
+            real_to_fake_mapping = {}
+            if is_traceable_wrapper_subclass(t):
+                # Fake-ify t naively here; this is only done so we can get fake-ified inner
+                # tensors with the correct relationships to the outer sizes / strides for use
+                # in view replay. It's done beforehand here because it's not easy to do when
+                # visiting tensors one-by-one during view replay.
+                #
+                # Example:
+                #   Consider a Dense -> NJT view. NJT has (values, offsets) components and we
+                #   want a view of values with the offsets closed over. As the offsets component
+                #   is needed to describe the output view, it's important that it's fakeified
+                #   correctly.
+                fake_t = empty_create_subclass(
+                    t, outer_size=sizes, outer_stride=strides
+                )
+                attrs, _ = fake_t.__tensor_flatten__()
+                for attr in attrs:
+                    real_to_fake_mapping[getattr(t, attr)] = getattr(fake_t, attr)
+
+            def tensor_visitor_fn(t):
+                # Fake inner tensors of view subclasses will come from the mapping built above.
+                fake_t = real_to_fake_mapping.get(t, None)
+                if fake_t is not None:
+                    return fake_t
+
+                # For other closed-over tensor state, fake-ify it as all dynamic with an
+                # ephemeral source. This avoids invalid specialization during view replay.
+                return all_dynamic_meta_tensor(
+                    t, source=EphemeralSource("tensor_visitor_fn")
+                )
+
+            # Replay the view, swapping out any non-symbolic SymInts or real tensors
+            # for symbolic SymInts or fake tensors.
+            fake_t = t._view_func_unsafe(base, symint_visitor_fn, tensor_visitor_fn)
+
+            # Ensure the output has symbolic shapes according to the outer symbolic context.
+            # These checks should simplify out any symbols created for closed-over view func
+            # SymInts.
+            torch._check(fake_t.size() == sizes)
+            torch._check(fake_t.stride() == strides)
+            torch._check(fake_t.storage_offset() == storage_offset)
+            return fake_t
+
         # see expired-storages
         self.check_expired_count += 1
         if self.check_expired_count >= self.check_expired_frequency:
@@ -358,24 +532,21 @@ class MetaConverter:
                     # version counters to get shared.
                     assert t._is_view()
 
-                    from torch._dynamo.source import AttrSource
-                    from torch.fx.experimental.symbolic_shapes import (
-                        DimDynamic,
-                        StatelessSymbolicContext,
-                    )
-
-                    if shape_env and not t.is_nested and not t._base.is_nested:
-                        base_symbolic_context = StatelessSymbolicContext(
-                            dynamic_sizes=[DimDynamic.STATIC] * t._base.dim(),
-                            constraint_sizes=[None] * t._base.dim(),
+                    base_symbolic_context = None
+                    if shape_env and symbolic_context is not None:
+                        from torch.fx.experimental.symbolic_shapes import (
+                            StatelessSymbolicContext,
                         )
-                    else:
-                        base_symbolic_context = None
+
+                        assert isinstance(symbolic_context, StatelessSymbolicContext)
+                        assert symbolic_context.view_base_context is not None
+                        base_symbolic_context = symbolic_context.view_base_context
+
                     base = self.meta_tensor(
                         t._base,
                         shape_env,
                         callback,
-                        source=AttrSource(source, "_base"),
+                        source=torch._dynamo.source.AttrSource(source, "_base"),
                         symbolic_context=base_symbolic_context,
                     )
 
@@ -427,40 +598,18 @@ class MetaConverter:
                         #
                         # So we may have to do *two* views out of the base to
                         # recreate this situation.
-                        def _view_from_base(base, t):
-                            if t.is_nested:
-                                # Nested tensors do not support as_strided, and
-                                # hence,always have _view_func available.
-                                #
-                                # The unsafe version of _view_func omits
-                                # checking whether the base passed in has the same
-                                # metadata as the original base the view_func
-                                # was originally executed with. (1) It is OK here,
-                                # because we're calling it on the meta-ified base,
-                                # so the metadata is guaranteed to be the same.
-                                # (2) It is necessary because we don't actually
-                                # want to guard on the base's metadata here.
-                                return t._view_func_unsafe(base)
-                            else:
-                                (
-                                    sizes,
-                                    strides,
-                                    storage_offset,
-                                ) = sym_sizes_strides_storage_offset(t, source)
-                                return base.as_strided(sizes, strides, storage_offset)
-
                         if safe_is_leaf(t):
                             # Leaf views that track view metadata are created by
                             # creating a view inside a no_grad block
                             with torch.no_grad(), maybe_suppress():
-                                r = _view_from_base(base, t)
+                                r = view_from_base(base, t)
                             # As it's a leaf, we can directly assign requires_grad
                             r.requires_grad = t.requires_grad
                         else:
                             if t._base.requires_grad == t.requires_grad:
                                 # Easy case, just run the view op
                                 with torch.enable_grad(), maybe_suppress():
-                                    r = _view_from_base(base, t)
+                                    r = view_from_base(base, t)
 
                                 # NB: We don't actaully faithfully replicate
                                 # autograd connectivity, but that doesn't matter
@@ -475,7 +624,7 @@ class MetaConverter:
                                     mid = base.view(base.shape)
                                 mid.requires_grad = t.requires_grad
                                 with torch.enable_grad(), maybe_suppress():
-                                    r = _view_from_base(mid, t)
+                                    r = view_from_base(mid, t)
                         # The CreationMeta influences whether or not inplace
                         # mutation is an error or not.  So we need to make
                         # sure we properly propagate this as well.
@@ -490,10 +639,6 @@ class MetaConverter:
                 else:
                     is_leaf = safe_is_leaf(t)
 
-                    from torch.fx.experimental.symbolic_shapes import (
-                        SubclassSymbolicContext,
-                    )
-
                     (
                         sizes,
                         strides,
@@ -503,30 +648,8 @@ class MetaConverter:
                     # If we have a subclass that desugars into dense tensors,
                     # perform our callback on each inner tensor.
                     if is_traceable_wrapper_subclass(t):
-                        # Note: transform_subclass will use __tensor_unflatten__ to generate
-                        # a fresh subclass wrapper. We assume that if the inner tensors of
-                        # the subclass are given symbolic sizes, their sizes will be used
-                        # to construct the (symbolic) sizes of the wrapper tensor.
-                        from torch._dynamo.source import AttrSource
-
-                        assert symbolic_context is None or isinstance(
-                            symbolic_context, SubclassSymbolicContext
-                        )
-                        r = transform_subclass(
-                            t,
-                            lambda attr, inner_t: callback(
-                                lambda: empty_create(
-                                    inner_t,
-                                    AttrSource(source, attr),
-                                    symbolic_context=(
-                                        None
-                                        if symbolic_context is None
-                                        else symbolic_context.inner_contexts[attr]
-                                    ),
-                                )
-                            ),
-                            outer_size=sizes,
-                            outer_stride=strides,
+                        r = empty_create_subclass(
+                            t, outer_size=sizes, outer_stride=strides
                         )
                     else:
                         r = callback(
