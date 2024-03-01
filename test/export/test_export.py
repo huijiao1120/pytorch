@@ -95,7 +95,7 @@ class TestDynamismExpression(TestCase):
         # Being able to export means shape is preserved as static
         export(branch_on_shape, inp)
 
-
+@unittest.skipIf(IS_WINDOWS, "Windows isn't supported for this case")
 @unittest.skipIf(not torchdynamo.is_dynamo_supported(), "dynamo isn't support")
 class TestExport(TestCase):
 
