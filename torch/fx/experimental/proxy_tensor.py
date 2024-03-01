@@ -1149,7 +1149,7 @@ def disable_proxy_modes_tracing():
         if old_mode_from_aot_dispatch is not None:
             torch._C._set_dispatch_mode(old_mode_from_aot_dispatch)
         if old_mode_from_pre_dispatch is not None:
-            _push_mode(old_mode_from_aot_dispatch, torch._C.DispatchKey.PreDispatch)
+            _push_mode(old_mode_from_pre_dispatch, torch._C.DispatchKey.PreDispatch)
 
 
 def maybe_handle_decomp(proxy_mode, op, args, kwargs):
