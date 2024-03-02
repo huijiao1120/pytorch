@@ -1225,6 +1225,46 @@ class FakeTensorMode(TorchDispatchMode):
             # NOTE: incr is intentionally unused for a RAII pattern
             incr = IncrementRecursionCount()
 
+        def _fakify_script_object(x):
+            # NOTE: Skip fakifying inputs to torch.ops.profiler because they only have c++ implementation
+            # and are performance critical. The suggested workaround will cause non-eligible overhead.
+            if func in {
+                torch.ops.profiler._record_function_enter_new,
+                torch.ops.profiler._record_function_exit._RecordFunction,
+            }:
+                return x
+
+            full_qualname = x._type().qualified_name()
+            if not hasattr(x, "__get_metadata__"):
+                raise RuntimeError(
+                    f"Trying to fake tensor dispatch {func} that takes ScriptObject {full_qualname} "
+                    f" as input but the script object doesn't have a __get_metadata__ method. "
+                    f" Please add a __get_metadata__ method to the script object with .def_meta()."
+                )
+
+            if not torch._library.abstract_impl_class.global_abstract_class_registry.has_impl(
+                full_qualname
+            ):
+                raise RuntimeError(
+                    f" ScriptObject's {full_qualname} haven't registered a fake class. If {func} is supposed "
+                    f" to be exported as a node in graph and preserve the script obj as input to the node, "
+                    f" please use impl_abstract_class to register a fake class for the script obj. Otherwise,"
+                    f" consider disabling fake modes for the operator by callig it with ctx manager maybe_disable_fake_tensor_mode."
+                )
+            fake_class = torch._library.abstract_impl_class.global_abstract_class_registry.get_impl(
+                full_qualname
+            )
+            if not hasattr(fake_class, "from_real"):
+                raise RuntimeError(
+                    f"ScriptObject {full_qualname}'s corresponding fake_class {fake_class}"
+                    f" doesn't implement a from_real classmethod. Please add it to the fake class."
+                )
+            return fake_class.from_real(x)
+
+        args, kwargs = pytree.tree_map_only(
+            torch.ScriptObject, lambda x: _fakify_script_object(x), (args, kwargs)
+        )
+
         # Some attribute queries that can be serviced directly
         # See Note [is_coalesced is dispatched]
         if func in _DISPATCH_HANDLE_DIRECTLY:

@@ -339,9 +339,10 @@ TORCH_LIBRARY(_TorchScriptTesting, m) {
           },
           [](std::vector<int64_t> state) { // __setstate__
             return c10::make_intrusive<Foo>(state[0], state[1]);
-          });
-  m.def(
-      "takes_foo(__torch__.torch.classes._TorchScriptTesting._Foo foo, Tensor x) -> Tensor");
+          })
+      .def_meta([](c10::intrusive_ptr<Foo> self) { // __get_metadata__
+        return std::vector<int64_t>{self->x, self->y};
+      });
 
   m.class_<FooGetterSetter>("_FooGetterSetter")
       .def(torch::init<int64_t, int64_t>())
@@ -472,15 +473,18 @@ TORCH_LIBRARY(_TorchScriptTesting, m) {
           });
 }
 
+TORCH_LIBRARY_FRAGMENT(_TorchScriptTesting, m) {
+  m.impl_abstract_pystub("torch.testing._internal.torchbind_impls");
+  m.def(
+      "takes_foo(__torch__.torch.classes._TorchScriptTesting._Foo foo, Tensor x) -> Tensor");
+}
+
 at::Tensor takes_foo(c10::intrusive_ptr<Foo> foo, at::Tensor x) {
   return foo->add_tensor(x);
 }
 
 TORCH_LIBRARY_IMPL(_TorchScriptTesting, CPU, m) {
   m.impl("takes_foo", takes_foo);
-}
-TORCH_LIBRARY_IMPL(_TorchScriptTesting, Meta, m) {
-  m.impl("takes_foo", &takes_foo);
 }
 
 } // namespace
