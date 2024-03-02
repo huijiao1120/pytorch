@@ -95,6 +95,10 @@ struct TORCH_API FunctionalTensorWrapper : public c10::TensorImpl {
         mutation_counter_;
   }
 
+  // Runs the forward_fn of every ViewMeta collected in the current instance
+  // to some other base.
+  Tensor apply_view_metas(const Tensor& base);
+
   // Is the recorded ViewMeta sequence of this instance equal to the sequence
   // on the other FunctionalTensorWrapper instance?
   bool are_view_metas_equal(const Tensor& other);
