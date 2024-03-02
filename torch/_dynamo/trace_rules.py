@@ -34,6 +34,8 @@ import weakref
 from collections import defaultdict
 from typing import Any, Callable, cast, Dict, List, Optional, Set, Union
 
+import hypothesis
+
 np: Optional[types.ModuleType] = None
 try:
     import numpy as np
@@ -3095,6 +3097,7 @@ BUILTIN_SKIPLIST = (
     weakref,
     _collections_abc,
     _weakrefset,
+    hypothesis,
 )
 
 # third party libraries skiplist is defined by str, because users may not use these libraries.
@@ -3194,6 +3197,7 @@ MOD_INLINELIST = {
     "torch.random",
     "torch.sparse",
     "torch.testing",
+    "torch.testing._internal.hypothesis_utils",
     "torch.utils._content_store",
     "torch.utils._contextlib",
     "torch.utils._foreach_utils",
