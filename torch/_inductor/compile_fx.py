@@ -43,6 +43,7 @@ from torch._functorch.aot_autograd import aot_export_module, make_boxed_func
 from torch._inductor.codecache import code_hash, CompiledFxGraph, FxGraphCache
 
 from torch._inductor.debug import save_args_for_compile_fx_inner
+from torch._logging import trace_structured
 from torch._ops import OpOverload
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._utils_internal import signpost_event
@@ -246,6 +247,40 @@ def _unlift_graph(mod, gm, graph_signature):
     return unlifted_gm
 
 
+def _get_subgraph_names(gm):
+    for node in gm.graph.nodes:
+        if node.target == torch.ops.higher_order.cond:
+            true_subgraph_name = node.args[1].name
+            false_subgraph_name = node.args[2].name
+            yield true_subgraph_name
+            yield false_subgraph_name
+
+
+def _recursive_pre_grad_passes(gm, example_inputs):
+    for subgraph_name in _get_subgraph_names(gm):
+        subgraph = getattr(gm, subgraph_name)
+        # as we don't have recursive example inputs, passing None here
+        new_subgraph = _recursive_pre_grad_passes(subgraph, example_inputs=None)
+        setattr(gm, subgraph_name, new_subgraph)
+    return pre_grad_passes(gm, example_inputs)
+
+
+def _recursive_joint_graph_passes(gm, inference_with_onednn_graph=False):
+    for subgraph_name in _get_subgraph_names(gm):
+        subgraph = getattr(gm, subgraph_name)
+        _recursive_joint_graph_passes(
+            subgraph, inference_with_onednn_graph
+        )
+    joint_graph_passes(gm, inference_with_onednn_graph)
+
+
+def _recursive_post_grad_passes(gm, is_inference: bool = False):
+    for subgraph_name in _get_subgraph_names(gm):
+        subgraph = getattr(gm, subgraph_name)
+        _recursive_post_grad_passes(subgraph, is_inference)
+    post_grad_passes(gm, is_inference)
+
+
 def split_const_gm(
     gm: torch.fx.GraphModule,
 ) -> Tuple[torch.fx.GraphModule, Dict[str, int]]:
@@ -334,7 +369,7 @@ def count_bytes_inner(
     fake_mode = fake_tensor_prop(gm, example_inputs)
 
     with V.set_fake_mode(fake_mode):
-        post_grad_passes(gm, False)
+        _recursive_post_grad_passes(gm, False)
 
     graph = GraphLowering(gm, shape_env=shape_env, num_static_inputs=num_fixed)
     with V.set_graph_handler(graph), V.set_real_inputs(example_inputs):
@@ -630,6 +665,9 @@ def fx_codegen_and_compile(
         f"graph {graph_id}",
     )
     V.debug.fx_graph(gm, example_inputs)
+    # TODO: Should we actually dump this?  It should be redundant with the aot
+    # structured logs...
+    # trace_structured("inductor_input_graph", payload_fn=lambda: gm.print_readable(print_output=False))
 
     shape_env = _shape_env_from_inputs(example_inputs)
 
@@ -664,9 +702,13 @@ def fx_codegen_and_compile(
 
     with V.set_fake_mode(fake_mode):
         # has some issues with memory in training
-        post_grad_passes(gm, is_inference=is_inference)
+        _recursive_post_grad_passes(gm, is_inference=is_inference)
         V.debug.fx_graph_transformed(gm, example_inputs)
         post_grad_graphs_log.debug("%s", lazy_format_graph_code("AFTER POST GRAD", gm))
+        trace_structured(
+            "inductor_post_grad_graph",
+            payload_fn=lambda: gm.print_readable(print_output=False),
+        )
         optimus_scuba_log["inductor_post_grad"] = counters["inductor"]
         signpost_event(
             "optimus",
@@ -1073,7 +1115,8 @@ def fw_compiler_freezing(
     inference_with_onednn_graph = may_use_onednn_graph(aot_example_inputs)
 
     # partition_fn won't be called
-    joint_graph_passes(
+
+    _recursive_joint_graph_passes(
         aot_autograd_model, inference_with_onednn_graph=inference_with_onednn_graph
     )
 
@@ -1212,7 +1255,7 @@ def compile_fx(
                 recursive_compile_fx,
             )
 
-        model_ = pre_grad_passes(model_, example_inputs_)
+        model_ = _recursive_pre_grad_passes(model_, example_inputs_)
         optimus_scuba_log["inductor_pre_grad"] = counters["inductor"]
         signpost_event(
             "optimus",
@@ -1248,7 +1291,8 @@ def compile_fx(
             inference_with_onednn_graph = may_use_onednn_graph(example_inputs)
 
             # partition_fn won't be called
-            joint_graph_passes(
+
+            _recursive_joint_graph_passes(
                 model, inference_with_onednn_graph=inference_with_onednn_graph
             )
 
@@ -1334,12 +1378,13 @@ def compile_fx(
         inference_compiler = functools.partial(fw_compiler_base, is_inference=True)
 
     def partition_fn(graph, joint_inputs, **kwargs):
-        joint_graph_passes(graph)
+        _recursive_joint_graph_passes(graph)
         return min_cut_rematerialization_partition(
             graph, joint_inputs, **kwargs, compiler="inductor"
         )
 
     @dynamo_utils.dynamo_timed
+    @dynamo_utils.maybe_cprofile
     def bw_compiler(model: torch.fx.GraphModule, example_inputs: List[torch.Tensor]):
         fixed = count_tangents(model)
         return inner_compile(
