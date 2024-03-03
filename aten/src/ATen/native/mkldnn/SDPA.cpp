@@ -1,10 +1,6 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
-#include <ATen/Config.h>
-#include <ATen/core/Tensor.h>
-#include <c10/core/SymIntArrayRef.h>
-#include <c10/util/ArrayRef.h>
+#include <ATen/native/mkldnn/Graph.h>
 #include <omp.h>
-#include <torch/library.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -17,95 +13,12 @@
 
 #if AT_ONEDNN_GRAPH_ENABLED()
 
-namespace std {
-template <>
-struct hash<std::vector<int64_t>> {
-  size_t operator()(const std::vector<int64_t>& key) const {
-    size_t total = key.size();
-    size_t sum = 0;
-    if (total < 64) {
-      for (size_t i = 0; i < total; i++) {
-        sum += key[i] << i;
-      }
-    } else {
-      size_t batch = total / 64;
-      size_t remaining = total % 64;
-      for (size_t bs = 0; bs < batch; bs++) {
-        for (size_t i = 0; i < 64; i++) {
-          sum += key[bs * 64 + i] << i;
-        }
-      }
-      for (size_t i = 0; i < remaining; i++) {
-        sum += key[batch * 64 + i] << i;
-      }
-    }
-    return sum;
-  }
-};
-
-} // namespace std
-
-#include <ATen/native/mkldnn/Utils.h>
-#include <c10/util/irange.h>
-#include <oneapi/dnnl/dnnl_graph.hpp>
-
 namespace at {
 namespace native {
 
-using namespace dnnl::graph;
-using data_type = logical_tensor::data_type;
-using layout_type = logical_tensor::layout_type;
-using dim = logical_tensor::dim;
-using dims = logical_tensor::dims;
-
 namespace {
 
-// assign a unique ID to each pattern here
-// using an enum is troublesome with using std::unordered_map
-// These should be used in torch/_inductor/fx_passes/fuse_attention.py
-// Instead of using magic numbers in the python code there,
-// we could even use custom classes.
-#define ONEDNN_GRAPH_SDPA_PATTERN_5_FP32 0
-#define ONEDNN_GRAPH_SDPA_PATTERN_5_BF16 1
-
-using RunArg = dnnl::graph::tensor;
-using RunArgs = std::vector<RunArg>;
-using LogicalTensors = std::vector<logical_tensor>;
-
-// Compiled Partition entry
-struct cp_entry {
-  partition partition_;
-  compiled_partition cp_;
-  RunArgs constantInputTensors_;
-  RunArgs inputLLGATensors_;
-  RunArgs outputLLGATensors_;
-  LogicalTensors inputLogicalTensors_;
-  LogicalTensors outputLogicalTensors_;
-};
-
-// Thread local data-structures are required if multiple thread-pools
-// of a PyTorch process would be used for inference.
-thread_local std::unordered_map<int32_t, dnnl::graph::partition> partition_map_;
-// Compiled partition (fused kernel) cache
-// Adopted from
-// https://github.com/lamerman/cpp-lru-cache/blob/master/include/lrucache.hpp
-using key_value_pair_t = std::pair<std::vector<int64_t>, cp_entry>;
-using list_iterator_t = std::list<key_value_pair_t>::iterator;
-thread_local std::list<key_value_pair_t> cache_items_list_;
-thread_local std::unordered_map<std::vector<int64_t>, list_iterator_t>
-    cache_items_map_;
-thread_local size_t capacity_ = 75000;
-
-// Compile a partition
-compiled_partition compile_partition(
-    const partition& partition,
-    const std::vector<logical_tensor>& inputs,
-    const std::vector<logical_tensor>& outputs) {
-  compiled_partition compilation;
-  compilation =
-      partition.compile(inputs, outputs, onednn_graph::Engine::getEngine());
-  return compilation;
-}
+using namespace onednn_graph;
 
 /*
    (f32/bf16)[Query]     [Key](f32/bf16)
@@ -193,7 +106,7 @@ void create_graph_sdpa_pattern_5(data_type dtype) {
       " only one fusion group allowed");
   int patternID = dtype == data_type::bf16 ? ONEDNN_GRAPH_SDPA_PATTERN_5_BF16
                                            : ONEDNN_GRAPH_SDPA_PATTERN_5_FP32;
-  partition_map_[patternID] = std::move(partition);
+  insert_in_partition_cache(patternID, partition);
 }
 
 // Execute SDPA partition
@@ -334,12 +247,12 @@ Tensor mkldnn_graph_sdpa_pattern(
         attn_mask_val.sizes().end());
   }
 
-  auto iter = cache_items_map_.find(map_key);
-  if (iter == cache_items_map_.end()) {
+  auto iter = cache_lookup(map_key);
+  if (iter == cache_end()) {
     cp_entry compiledPartitionEntry;
-    auto graph_partition_iter = partition_map_.find(patternID);
+    auto graph_partition_iter = partition_map_lookup(patternID);
     partition graph_partition;
-    if (graph_partition_iter == partition_map_.end()) {
+    if (graph_partition_iter == partition_map_end()) {
       auto dtype = query.scalar_type();
       TORCH_CHECK(
           ((dtype == at::ScalarType::Float) ||
@@ -349,16 +262,12 @@ Tensor mkldnn_graph_sdpa_pattern(
         case ONEDNN_GRAPH_SDPA_PATTERN_5_FP32:
           create_graph_sdpa_pattern_5(data_type::f32);
           break;
-        case ONEDNN_GRAPH_SDPA_PATTERN_5_BF16:
-          create_graph_sdpa_pattern_5(data_type::bf16);
-          break;
       }
-      graph_partition_iter = partition_map_.find(patternID);
+      graph_partition_iter = partition_map_lookup(patternID);
     }
     graph_partition = graph_partition_iter->second;
     switch (patternID) {
       case ONEDNN_GRAPH_SDPA_PATTERN_5_FP32:
-      case ONEDNN_GRAPH_SDPA_PATTERN_5_BF16:
         compile_and_cache_sdpa_pattern_5(
             graph_partition,
             query,
@@ -370,19 +279,10 @@ Tensor mkldnn_graph_sdpa_pattern(
     }
     auto retVal = execute_sdpa_partition(
         query, key, value, scale, attn_mask, compiledPartitionEntry);
-    cache_items_list_.push_front(
-        key_value_pair_t(map_key, std::move(compiledPartitionEntry)));
-    cache_items_map_[map_key] = cache_items_list_.begin();
-    if (cache_items_map_.size() > capacity_) {
-      auto last = cache_items_list_.end();
-      last--;
-      cache_items_map_.erase(last->first);
-      cache_items_list_.pop_back();
-    }
+    insert_in_fused_kernel_cache(map_key, compiledPartitionEntry);
     return retVal;
   } else {
-    cache_items_list_.splice(
-        cache_items_list_.begin(), cache_items_list_, iter->second);
+    change_pos_in_list(iter->second);
     cp_entry& cp = iter->second->second;
     return execute_sdpa_partition(query, key, value, scale, attn_mask, cp);
   }
@@ -393,6 +293,9 @@ Tensor mkldnn_graph_sdpa_pattern(
 
 namespace meta {
 namespace {
+
+using namespace at::native;
+using namespace onednn_graph;
 
 bool is_any_shape_symbolic(SymIntArrayRef& shape) {
   auto shape_vec = shape.vec();
@@ -469,12 +372,12 @@ Tensor mkldnn_graph_sdpa_pattern_meta(
         map_key.end(), attn_mask_sizes.begin(), attn_mask_sizes.end());
   }
 
-  auto iter = at::native::cache_items_map_.find(map_key);
-  if (iter == at::native::cache_items_map_.end()) {
-    at::native::cp_entry compiledPartitionEntry;
-    auto graph_partition_iter = at::native::partition_map_.find(patternID);
+  auto iter = cache_lookup(map_key);
+  if (iter == cache_end()) {
+    cp_entry compiledPartitionEntry;
+    auto graph_partition_iter = partition_map_lookup(patternID);
     dnnl::graph::partition graph_partition;
-    if (graph_partition_iter == at::native::partition_map_.end()) {
+    if (graph_partition_iter == partition_map_end()) {
       auto dtype = query.scalar_type();
       TORCH_CHECK(
           ((dtype == at::ScalarType::Float) ||
@@ -482,21 +385,16 @@ Tensor mkldnn_graph_sdpa_pattern_meta(
           "Only BF16 & FP32 datatypes are currently supported");
       switch (patternID) {
         case ONEDNN_GRAPH_SDPA_PATTERN_5_FP32:
-          at::native::create_graph_sdpa_pattern_5(
+          create_graph_sdpa_pattern_5(
               dnnl::graph::logical_tensor::data_type::f32);
           break;
-        case ONEDNN_GRAPH_SDPA_PATTERN_5_BF16:
-          at::native::create_graph_sdpa_pattern_5(
-              dnnl::graph::logical_tensor::data_type::bf16);
-          break;
       }
-      graph_partition_iter = at::native::partition_map_.find(patternID);
+      graph_partition_iter = partition_map_lookup(patternID);
     }
     graph_partition = graph_partition_iter->second;
     switch (patternID) {
       case ONEDNN_GRAPH_SDPA_PATTERN_5_FP32:
-      case ONEDNN_GRAPH_SDPA_PATTERN_5_BF16:
-        at::native::compile_and_cache_sdpa_pattern_5(
+        compile_and_cache_sdpa_pattern_5(
             graph_partition,
             query,
             key,
@@ -505,21 +403,9 @@ Tensor mkldnn_graph_sdpa_pattern_meta(
             attn_mask.value(),
             compiledPartitionEntry);
     }
-    at::native::cache_items_list_.push_front(at::native::key_value_pair_t(
-        map_key, std::move(compiledPartitionEntry)));
-    at::native::cache_items_map_[map_key] =
-        at::native::cache_items_list_.begin();
-    if (at::native::cache_items_map_.size() > at::native::capacity_) {
-      auto last = at::native::cache_items_list_.end();
-      last--;
-      at::native::cache_items_map_.erase(last->first);
-      at::native::cache_items_list_.pop_back();
-    }
+    insert_in_fused_kernel_cache(map_key, compiledPartitionEntry);
   } else {
-    at::native::cache_items_list_.splice(
-        at::native::cache_items_list_.begin(),
-        at::native::cache_items_list_,
-        iter->second);
+    change_pos_in_list(iter->second);
   }
   return query;
 }
@@ -541,4 +427,5 @@ TORCH_LIBRARY_IMPL(mkldnn, CPU, m) {
 }
 } // namespace native
 } // namespace at
+
 #endif // AT_ONEDNN_GRAPH_ENABLED
