@@ -1,4 +1,5 @@
 import functools
+import hashlib
 
 from torch._dynamo.device_interface import get_interface_for_device
 
@@ -28,3 +29,21 @@ def has_triton() -> bool:
         return False
 
     return is_device_compatible_with_triton() and has_triton_package()
+
+
+@functools.lru_cache(None)
+def triton_backend():
+    from triton.compiler.compiler import make_backend
+    from triton.runtime.driver import driver
+
+    target = driver.active.get_current_target()
+    return make_backend(target)
+
+
+@functools.lru_cache(None)
+def triton_hash_with_backend():
+    from triton.compiler.compiler import triton_key
+
+    backend = triton_backend()
+    key = f"{triton_key()}-{backend.hash()}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
